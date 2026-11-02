@@ -208,12 +208,13 @@ _hs_image="
 Usage:
     vm image list
     vm image create [-d <description>] [-u] <name>
-    vm image provision [-d <datastore>] <uuid> <name>
+    vm image provision [-d <datastore>] [-k <keyfile>] <uuid> <name>
     vm image destroy <uuid>
 
 Options:
     -u                      Do not compress the image
     -d <descr|datastore>    Description or datastore
+    -k <keyfile>            Key of the source guest, for encrypted images
 "
 
 #------------------------------------------------------------------------------

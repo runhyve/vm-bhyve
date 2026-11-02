@@ -354,7 +354,9 @@ Keep the keys outside the pool that holds the guests (for example on a separate 
 A key stored on the same disks as the data does not protect it if the disks are stolen.
 
 The key is loaded when the guest starts and unloaded when it stops. Set `encryption_keep_loaded="yes"`
-to keep it loaded. `vm migrate`, `vm clone` and `vm image create` don't support encrypted guests yet.
+to keep it loaded. `vm migrate` sends encrypted guests raw and copies the key to the remote host.
+`vm image create` works too, but the image doesn't include the key, so provisioning it needs the key of the
+source guest (`vm image provision -k <keyfile> <uuid> <name>`). `vm clone` doesn't support encrypted guests yet.
 See the ENCRYPTION section of the man page for details.
 
 ## Windows Support

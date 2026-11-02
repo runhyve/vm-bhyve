@@ -221,6 +221,7 @@
 .Nm
 .Cm image provision
 .Op Fl d Ar datastore
+.Op Fl k Ar keyfile
 .Ar uuid
 .Ar new-name
 .Nm
@@ -398,13 +399,35 @@ removes the key if it is in the default location.
 moves it.
 .Pp
 .Nm
-.Cm migrate ,
+.Cm migrate
+sends encrypted ZVOLs raw, so they stay encrypted in transit, and copies the key
+to the remote host before any data is sent.
+The key is passed to
 .Nm
-.Cm clone
-and
+.Cm migrate
+on the remote host over ssh, and stored in the default location for the guest
+on that host, or at the same path if
+.Sy encryption_key
+is set.
+The remote host must run a version of
+.Nm
+with encryption support.
+.Pp
 .Nm
 .Cm image create
-are not supported for encrypted guests yet.
+also sends encrypted ZVOLs raw.
+The image does not contain the key; it has to be given to
+.Nm
+.Cm image provision
+with
+.Fl k .
+The new guest is then switched to its own, newly generated key.
+ZFS only changes the key that wraps the data encryption key, so guests
+provisioned from the same image still share the data encryption key.
+.Pp
+.Nm
+.Cm clone
+is not supported for encrypted guests yet.
 .\" ============ QUICKSTART =============
 .Sh QUICKSTART
 Create a virtual switch called
@@ -1246,6 +1269,9 @@ The guest must always be stopped to use this command.
 .Ar guest host
 .Xc
 The migrate subcommand allows transferring a guest from one host to another.
+Encrypted guests are sent raw, and their key is copied to the remote host first.
+See
+.Sx ENCRYPTION .
 Note that currently this involves shutting down the guest, and optionally
 restarting it once migration is complete.
 .Pp
@@ -1407,6 +1433,7 @@ option.
 .It Xo
 .Cm image provision
 .Op Fl d Ar datastore
+.Op Fl k Ar keyfile
 .Ar uuid Ar new-name
 .Xc
 Create a new virtual machine, named
@@ -1415,6 +1442,11 @@ from the specified image UUID.
 This will be created on the
 .Sy default
 datastore unless specified otherwise.
+.Pp
+If the image was created from an encrypted guest,
+.Fl k
+must give the key file of that guest.
+The new guest gets its own key in the default location.
 .It Cm image destroy Ar uuid
 Destroy the specified image.
 .El

@@ -329,7 +329,7 @@ zfs::clone(){
 zfs::image_create(){
     local _name _opt _desc
     local _uuid _snap _date _no_compress _filename
-    local _compress _decompress
+    local _compress _decompress _raw _flags="-R" _key_uri
 
     while getopts d:u _opt ; do
         case $_opt in
@@ -351,8 +351,10 @@ zfs::image_create(){
     datastore::get_guest "${_name}" || util::err "${_name} does not appear to be a valid virtual machine"
     [ -z "${VM_ZFS}" -o -z "${VM_DS_ZFS}" ] && util::err "this command is only supported on zfs datastores"
 
+    # encrypted zvols can only be sent raw. the key is not part of the image
     config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
-    crypt::enabled && util::err "creating images of encrypted guests is not supported yet"
+    crypt::is_encrypted "${_name}" && _raw="1"
+    crypt::enabled && crypt::key_uri "_key_uri" "${_name}"
 
     # create the image dataset if we don't have it
     if [ ! -e "${vm_dir}/images" ]; then
@@ -364,12 +366,14 @@ zfs::image_create(){
     zfs snapshot -r "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" >/dev/null 2>&1
     [ $? -eq 0 ] || util::err "failed to create snapshot of source dataset ${VM_DS_ZFS_DATASET}/${_name}@${_snap}"
 
+    [ -n "${_raw}" ] && _flags="-Rw"
+
     # copy source
     if [ -n "${_no_compress}" ]; then
         _filename="${_uuid}.zfs"
 
         echo "Creating guest image, this may take some time..."
-        zfs send -R "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" > "${vm_dir}/images/${_filename}"
+        zfs send ${_flags} "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" > "${vm_dir}/images/${_filename}"
     else
         _filename="${_uuid}.zfs.z"
 
@@ -384,7 +388,7 @@ zfs::image_create(){
         fi
 
         echo "Creating a compressed image, this may take some time..."
-        zfs send -R "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ${_compress} > "${vm_dir}/images/${_filename}"
+        zfs send ${_flags} "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ${_compress} > "${vm_dir}/images/${_filename}"
     fi
 
     [ $? -ne 0 ] && exit 1
@@ -399,7 +403,18 @@ zfs::image_create(){
     sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" "filename=${_filename}" >/dev/null 2>&1
     sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" "decompress=${_decompress}" >/dev/null 2>&1
 
+    if [ -n "${_raw}" ]; then
+        sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" "encrypted=yes" >/dev/null 2>&1
+        sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" "encryption_key=${_key_uri}" >/dev/null 2>&1
+    fi
+
     echo "Image of ${_name} created with UUID ${_uuid}"
+
+    if [ -n "${_raw}" ]; then
+        echo "NOTICE: the image is encrypted and does not contain the key."
+        echo "NOTICE: provisioning it requires the key of ${_name}${_key_uri:+ (${_key_uri})}:"
+        echo "NOTICE:   vm image provision -k <keyfile> ${_uuid} <name>"
+    fi
 }
 
 # 'vm image provision'
@@ -411,10 +426,12 @@ zfs::image_create(){
 zfs::image_provision(){
     local _uuid _name _file _oldname _entry _num=0 _type
     local _datastore="default" _decompress
+    local _encrypted _keyfile _img_key _new_key _new_key_created
 
-    while getopts d: _opt ; do
+    while getopts d:k: _opt ; do
         case $_opt in
             d) _datastore="${OPTARG}" ;;
+            k) _keyfile="${OPTARG}" ;;
             *) help::show "image" ;;
         esac
     done
@@ -437,6 +454,27 @@ zfs::image_provision(){
 
     # get the datastore to create on
     datastore::get "${_datastore}" || util::err "unable to locate datastore '${_datastore}'"
+
+    # an encrypted image needs the key of the guest it was taken from.
+    # check it now, before receiving anything
+    _encrypted=$(sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" encrypted)
+
+    if util::yesno "${_encrypted}"; then
+        if [ -z "${_keyfile}" ]; then
+            _img_key=$(sysrc -inqf "${vm_dir}/images/${_uuid}.manifest" encryption_key)
+            util::err "image is encrypted, specify the key of '${_oldname}'${_img_key:+ (${_img_key})} with -k <keyfile>"
+        fi
+
+        case "${_keyfile}" in
+            /*) _img_key="file://${_keyfile}" ;;
+            *)  _img_key="file://$(pwd)/${_keyfile}" ;;
+        esac
+
+        crypt::check "${_img_key}" || util::err "${VM_CRYPT_ERROR}"
+        crypt::default_uri "_new_key" "${_name}"
+    elif [ -n "${_keyfile}" ]; then
+        util::warn "image is not encrypted, ignoring -k"
+    fi
 
     # try to receive
     echo "Unpacking guest image, this may take some time..."
@@ -470,6 +508,26 @@ zfs::image_provision(){
     # vm may be started when 'vm image create' is executed
     rm -f "${VM_DS_PATH}/${_name}/run.lock" >/dev/null 2>&1
     rm -f "${VM_DS_PATH}/${_name}/vm-bhyve.log*" >/dev/null 2>&1
+
+    # give the new guest its own key. the guest arrives using the image key,
+    # so we change the zvols over to a new key in the default location
+    if [ -n "${_img_key}" ]; then
+        config::remove "${_name}" "encryption_key"
+        config::set "${_name}" "encryption" "yes"
+        config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+
+        crypt::exists "${_new_key}" || _new_key_created="1"
+
+        if ! crypt::generate "${_new_key}" || ! crypt::rekey "${_name}" "${_img_key}" "${_new_key}"; then
+            echo "${0}: ERROR: ${VM_CRYPT_ERROR}" >&2
+            echo "removing partially provisioned guest ${_name}" >&2
+            zfs::destroy_dataset "${VM_DS_ZFS_DATASET}/${_name}"
+            [ -n "${_new_key_created}" ] && crypt::remove "${_new_key}"
+            exit 1
+        fi
+
+        echo "Encrypted guest ${_name} uses key ${_new_key}"
+    fi
 }
 
 # 'vm image list'

@@ -88,10 +88,70 @@ crypt::check(){
 #
 crypt::generate(){
     local _uri="$1"
+    local _backend _key
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+
+    # reuse an existing key
+    if crypt::__${_backend}_exists "${_uri}"; then
+        crypt::check "${_uri}"
+        return $?
+    fi
+
+    _key=$(openssl rand -hex 32 2>/dev/null)
+
+    if [ $? -ne 0 -o -z "${_key}" ]; then
+        VM_CRYPT_ERROR="failed to generate encryption key"
+        return 1
+    fi
+
+    crypt::store "${_uri}" "${_key}"
+}
+
+# store a key at the specified location.
+# the key is passed as an argument rather than on stdin, so the backend can
+# set VM_CRYPT_ERROR (a pipeline would run us in a subshell). this never
+# reaches a command line as long as backends only use shell builtins with it.
+# if the location already has a key, it must be the same key.
+#
+# @param string _uri the key location
+# @param string _key the hex encoded key
+# @return success if the key is now stored
+#
+crypt::store(){
+    local _uri="$1"
+    local _key="$2"
     local _backend
 
     crypt::__backend "_backend" "${_uri}" || return 1
-    crypt::__${_backend}_generate "${_uri}"
+
+    # 32 bytes, hex encoded, as required by keyformat=hex
+    case "${_key}" in
+        *[!0-9a-fA-F]*|"")
+            VM_CRYPT_ERROR="invalid encryption key, expected 64 hex characters"
+            return 1
+            ;;
+    esac
+
+    if [ ${#_key} -ne 64 ]; then
+        VM_CRYPT_ERROR="invalid encryption key, expected 64 hex characters"
+        return 1
+    fi
+
+    crypt::__${_backend}_store "${_uri}" "${_key}"
+}
+
+# see if a key exists at the specified location
+#
+# @param string _uri the key location
+# @return success if a key exists
+#
+crypt::exists(){
+    local _uri="$1"
+    local _backend
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+    crypt::__${_backend}_exists "${_uri}"
 }
 
 # write a key to stdout
@@ -157,6 +217,70 @@ crypt::volumes(){
         awk -F'\t' '$1 == $2 && $3 == "prompt" {print $1}')
 
     setvar "${_var}" "${_list}"
+}
+
+# see if a guest has any zvols that we manage encryption for.
+# unlike crypt::enabled this looks at zfs, not the guest configuration
+#
+# @param string _name the guest name
+# @return success if the guest has encrypted zvols
+#
+crypt::is_encrypted(){
+    local _name="$1"
+    local _vols
+
+    crypt::volumes "_vols" "${_name}"
+    [ -n "${_vols}" ]
+}
+
+# change the key of all encrypted zvols of a guest.
+# used when a guest arrives with a key that isn't its own (image provision).
+# zvols are unlocked using the old key if needed, and left in the state
+# we found them in.
+#
+# note that zfs only changes the wrapping key. the data encryption key is
+# kept, so guests provisioned from the same image still share it.
+#
+# @param string _name the guest name
+# @param string _old the current key location
+# @param string _new the new key location
+# @return success if all zvols now use the new key
+#
+crypt::rekey(){
+    local _name="$1"
+    local _old="$2"
+    local _new="$3"
+    local _vols _vol _status _loaded _rc=0
+
+    VM_CRYPT_ERROR=""
+    crypt::check "${_new}" || return 1
+    crypt::volumes "_vols" "${_name}"
+
+    for _vol in ${_vols}; do
+        _loaded=""
+        _status=$(zfs get -Ho value keystatus "${_vol}" 2>/dev/null)
+
+        if [ "${_status}" != "available" ]; then
+            crypt::check "${_old}" || return 1
+
+            if ! crypt::fetch "${_old}" | zfs load-key -L prompt "${_vol}" >/dev/null 2>&1; then
+                VM_CRYPT_ERROR="failed to load encryption key for ${_vol} from ${_old}"
+                return 1
+            fi
+
+            _loaded="1"
+        fi
+
+        if ! crypt::fetch "${_new}" | zfs change-key -o keyformat=hex -o keylocation=prompt "${_vol}" >/dev/null 2>&1; then
+            VM_CRYPT_ERROR="failed to change encryption key for ${_vol}"
+            _rc=1
+        fi
+
+        [ -n "${_loaded}" ] && zfs unload-key "${_vol}" >/dev/null 2>&1
+        [ ${_rc} -ne 0 ] && return ${_rc}
+    done
+
+    return 0
 }
 
 # load the key for all encrypted zvols of a guest
@@ -336,22 +460,43 @@ crypt::__file_check(){
     return 0
 }
 
-# create a new key file
-# the key is 32 random bytes, hex encoded to suit keyformat=hex
+# see if a key file exists
 #
 # @private
 # @param string _uri the key location
 #
-crypt::__file_generate(){
+crypt::__file_exists(){
     local _uri="$1"
     local _path
 
     crypt::__file_path "_path" "${_uri}" || return 1
+    [ -e "${_path}" ]
+}
 
-    # reuse an existing key
+# write a key file
+# printf is a builtin, so the key never appears in a process argument list
+#
+# @private
+# @param string _uri the key location
+# @param string _key the hex encoded key
+#
+crypt::__file_store(){
+    local _uri="$1"
+    local _key="$2"
+    local _path
+
+    crypt::__file_path "_path" "${_uri}" || return 1
+
+    # an existing key is fine if it's the same key
     if [ -e "${_path}" ]; then
-        crypt::__file_check "${_uri}"
-        return $?
+        crypt::__file_check "${_uri}" || return 1
+
+        if [ "$(cat "${_path}")" != "${_key}" ]; then
+            VM_CRYPT_ERROR="a different encryption key already exists at ${_path}"
+            return 1
+        fi
+
+        return 0
     fi
 
     if ! ( umask 077 && mkdir -p "${_path%/*}" ) >/dev/null 2>&1; then
@@ -359,9 +504,9 @@ crypt::__file_generate(){
         return 1
     fi
 
-    if ! ( umask 077 && openssl rand -hex 32 > "${_path}" ) 2>/dev/null; then
+    if ! ( umask 077 && printf '%s\n' "${_key}" > "${_path}" ) 2>/dev/null; then
         rm -f "${_path}" >/dev/null 2>&1
-        VM_CRYPT_ERROR="failed to generate encryption key ${_path}"
+        VM_CRYPT_ERROR="failed to write encryption key ${_path}"
         return 1
     fi
 

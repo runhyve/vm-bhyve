@@ -14,11 +14,13 @@ migration::run(){
     local _renaming="0"
     local _config _opt _stage _inc _triple _rdataset _pid _exists _rname _running
     local _snap1 _snap2 _snap3 _destroy
+    local _key_name _key_uri _key_default _raw
     local _count=0
 
-    while getopts cn12txr:d:i: _opt; do
+    while getopts cn12txr:d:i:k: _opt; do
         case $_opt in
             c) _config="1" ;;
+            k) _key_name="${OPTARG}" ;;
             r) _rname="${OPTARG}" ;;
             n) _start="" ;;
             i) _inc="${OPTARG}" ;;
@@ -42,6 +44,12 @@ migration::run(){
         exit
     fi
 
+    # receive an encryption key from the sending host
+    if [ -n "${_key_name}" ]; then
+        migration::__store_key "${_key_name}"
+        exit
+    fi
+
     # basic checks
     [ -z "${_name}" -o -z "${_host}" ] && util::usage
     datastore::get_guest "${_name}" || util::err "unable to locate guest - '${_name}'"
@@ -59,6 +67,14 @@ migration::run(){
     # check guest can be sent
     config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
     migration::__check_compat
+
+    # encrypted zvols have to be sent raw, and the guest key sent ahead of them
+    crypt::is_encrypted "${_name}" && _raw="1"
+
+    if crypt::enabled; then
+        crypt::key_uri "_key_uri" "${_name}" && _key_default="1"
+        crypt::check "${_key_uri}" || util::err "${VM_CRYPT_ERROR}"
+    fi
 
     # check running state
     vm::confirm_stopped "${_name}" "1" >/dev/null 2>&1
@@ -79,6 +95,9 @@ migration::run(){
     echo "Attempting to send ${_name} to ${_host}"
     echo "  * remote dataset ${_rdataset}/${_rname}"
     [ -n "${_running}" ] && echo "  * source guest is powered on (#${_pid})"
+
+    # copy the key before any data so a problem stops us early
+    [ -n "${_key_uri}" ] && migrate::__send_key
 
     # STAGE 1
     # we send a full snapshot of the guest
@@ -161,6 +180,13 @@ migration::run(){
     if [ -n "${_destroy}" ]; then
         echo "  * removing source guest"
         zfs destroy -r "${VM_DS_ZFS_DATASET}/${_name}"
+
+        # only remove keys we manage, same as 'vm destroy'
+        if [ -n "${_key_default}" ]; then
+            crypt::remove "${_key_uri}" || echo "  ! ${VM_CRYPT_ERROR}"
+        elif [ -n "${_key_uri}" ]; then
+            echo "  * NOTICE: source encryption key ${_key_uri} has not been removed"
+        fi
     else
         echo "  * removing snapshots"
         [ -n "${_snap1}" ] && zfs destroy "${VM_DS_ZFS_DATASET}/${_name}@${_snap1}" >/dev/null 2>&1
@@ -202,17 +228,81 @@ migrate::__send(){
     local _snap="$2"
     local _inc="$3"
 
+    local _flags="-R"
+
+    # encrypted zvols can only be sent raw. they stay encrypted in transit
+    # and arrive locked, with keylocation=prompt
+    [ -n "${_raw}" ] && _flags="-Rw"
+
     # are we sending incremental?
     if [ -n "${_inc}" ]; then
         echo "  * stage ${_stage}: sending ${VM_DS_ZFS_DATASET}/${_name}@${_snap} (incremental source ${_inc})"
-        zfs send -Ri "${_inc}" "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
+        zfs send ${_flags}i "${_inc}" "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
     else
         echo "  * stage ${_stage}: sending ${VM_DS_ZFS_DATASET}/${_name}@${_snap}"
-        zfs send -R "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
+        zfs send ${_flags} "${VM_DS_ZFS_DATASET}/${_name}@${_snap}" | ssh ${_host} zfs recv "${_rdataset}/${_rname}"
     fi
 
     [ $? -eq 0 ] || util::err_inline "error detected while sending snapshot"
     echo "  * stage ${_stage}: snapshot sent"
+}
+
+# send the guest encryption key to the remote host.
+# the key goes over ssh on stdin, followed by the key location if the
+# guest has a custom encryption_key. otherwise the remote host stores it in
+# the default location for the (possibly renamed) guest.
+# running this again with the same key is fine, so separate stage 1 and
+# stage 2 runs both work.
+#
+migrate::__send_key(){
+    local _key _uri _out
+
+    _key=$(crypt::fetch "${_key_uri}")
+    [ -z "${_key_default}" ] && _uri="${_key_uri}"
+
+    echo "  * sending encryption key"
+    _out=$(printf '%s\n%s\n' "${_key}" "${_uri}" | ssh "${_host}" vm migrate -k "${_rname}" | tail -n 1)
+
+    case "${_out}" in
+        "")
+            util::err_inline "unable to send encryption key to ${_host}"
+            ;;
+        stored:*)
+            echo "  * NOTICE: copied encryption key for ${_name} to ${_host} (${_out#stored:})"
+            ;;
+        error:*)
+            util::err_inline "failed to store encryption key on ${_host}: ${_out#error:}"
+            ;;
+        *)
+            # older versions don't know -k, and just print usage
+            util::err_inline "remote vm-bhyve on ${_host} does not support encrypted guests"
+            ;;
+    esac
+}
+
+# store an encryption key sent by migrate::__send_key.
+# we output a single line that the sender can parse, starting with
+# "stored:" and the key location, or "error:" and a message
+#
+# @param string _name the guest name on this host
+#
+migration::__store_key(){
+    local _name="$1"
+    local _key _uri
+
+    util::check_name "${_name}" || { echo "error:invalid virtual machine name - '${_name}'"; exit 1; }
+
+    read -r _key
+    read -r _uri
+
+    [ -z "${_uri}" ] && crypt::default_uri "_uri" "${_name}"
+
+    if ! crypt::store "${_uri}" "${_key}"; then
+        echo "error:${VM_CRYPT_ERROR}"
+        exit 1
+    fi
+
+    echo "stored:${_uri}"
 }
 
 # currently just outputs zfs path or error if datastore isn't zfs
@@ -241,9 +331,6 @@ migration::__check_compat(){
     # check pass through
     config::get "_setting" "passthru0"
     [ -n "${_setting}" ] && _err="pci pass-through enabled"
-
-    # needs raw send and key transfer, not supported yet
-    crypt::enabled && _err="disk encryption enabled"
 
     # check for custom disks
     # file/zvol are under guest dataset and should go across ok
