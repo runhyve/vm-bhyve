@@ -265,7 +265,7 @@ switch::standard::__add_members(){
 
     # get the id if not provided
     if [ -z "${_id}" ]; then
-        switch::standard::id "_id" "${_switch}" || util:err "failed to get switch id while adding members"
+        switch::standard::id "_id" "${_switch}" || util::err "failed to get switch id while adding members"
     fi
 
     config::core::get "_ports" "ports_${_switch}"

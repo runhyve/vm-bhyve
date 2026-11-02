@@ -44,8 +44,8 @@ migration::run(){
 
     # basic checks
     [ -z "${_name}" -o -z "${_host}" ] && util::usage
-    datastore::get_guest "${_name}" || util:err "unable to locate guest - '${_name}'"
-    [ -z "${VM_DS_ZFS}" ] && util:err "the source datastore must be ZFS to support migration"
+    datastore::get_guest "${_name}" || util::err "unable to locate guest - '${_name}'"
+    [ -z "${VM_DS_ZFS}" ] && util::err "the source datastore must be ZFS to support migration"
     [ -n "${_stage}" -a -n "${_triple}" ] && util::err "single stage and triple stage are mutually exclusive"
     [ "${_stage}" = "2" -a -z "${_inc}" ] && util::err "source snapshot must be given when running stage 2"
 
@@ -129,7 +129,7 @@ migration::run(){
     fi
 
     # has it stopped?
-    kill -0 ${_pid} >/dev/null 2>&1 && util:err_inline "failed to stop guest"
+    kill -0 ${_pid} >/dev/null 2>&1 && util::err_inline "failed to stop guest"
     echo "  * stage 2: guest powered off"
 
     # only needed if running or specifically doing a stage 2
@@ -189,7 +189,7 @@ migrate::__rename_config(){
     ssh "${_host}" zfs mount "${_rdataset}/${_rname}" >/dev/null 2>&1
 
     echo "  * renaming configuration file to ${_rname}.conf"
-    ssh "${_host}" mv "${_path}/${_rname}/${_name}.conf" "${_path}/${_rname}/${_rname}.conf" >/dev/null 2>1
+    ssh "${_host}" mv "${_path}/${_rname}/${_name}.conf" "${_path}/${_rname}/${_rname}.conf" >/dev/null 2>&1
 
     if [ $? -ne 0 ]; then
         echo "  ! failed to find rename remote configuration file. guest may not start"
