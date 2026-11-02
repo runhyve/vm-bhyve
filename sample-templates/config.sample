@@ -476,6 +476,34 @@ zfs_dataset_opts=""
 #
 zfs_zvol_opts=""
 
+# encryption
+# Encrypt every ZVOL created for this guest using ZFS native encryption.
+# All guest disks must be zvol or sparse-zvol. This only affects ZVOLs
+# created after the option is set, so it should be set inside the guest
+# template (or use 'vm create -e').
+#
+# Default: no
+#
+encryption="yes"
+
+# encryption_key
+# Location of the guest encryption key. Only file:// is supported.
+# The key is created when the guest is created, unless the file already
+# exists. It must be mode 0400 (or stricter) and owned by root.
+#
+# Default: file://$vm_key_dir/{guest-name}.key
+# ($vm_key_dir is set in rc.conf, default /var/db/vm-bhyve/keys)
+#
+encryption_key="file:///secure/keys/guest.key"
+
+# encryption_keep_loaded
+# The encryption key is unloaded when the guest stops. Set this to
+# keep it loaded.
+#
+# Default: no
+#
+encryption_keep_loaded="no"
+
 # prestart
 # specify a script to run when the guest starts
 # if just a name rather than full path is provided, we look in the guest directory

@@ -139,6 +139,7 @@ Options:
     -c <number>     Number of guest virtual CPUs
     -m <size>       Size of guest physical memory (e.g., 256M, 16G, 1T)
     -i <image>      VM disk image (raw or qcow2)
+    -e              Encrypt zvol disks (requires a ZFS datastore)
     -C              Enable cloud-init
     -u <file>       cloud-init user-data file (Requires -C)
     -k <file>       SSH public key file       (Requires -C)
@@ -149,6 +150,7 @@ Examples:
     vm create -t linux -s 40G -c 4 -m 16G linux2
     vm create -t linux -c 4 -i example.qcow2 -C -k .ssh/authorized_keys linux3
     vm create -m 4G freebsd1
+    vm create -t freebsd-zvol -e freebsd2
     vm create ... -C \\
        -n \"ip=10.0.0.2/24,2001:db8::1234/64;nameservers=8.8.8.8\" netexample1
 "

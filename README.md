@@ -336,6 +336,27 @@ Please note, for Windows guests the type will need to be `ahci-hd`, as it does n
 
 Restart your vm.
 
+## Encrypted disks
+
+On a ZFS datastore, guest zvols can be encrypted with ZFS native encryption. Each guest gets its own
+key, which is created with the guest. All guest disks must be `zvol` or `sparse-zvol`.
+
+    # vm create -t freebsd-zvol -e encrypted-vm
+    # vm start encrypted-vm
+    Starting encrypted-vm
+      * found guest in /zroot/vm/encrypted-vm
+      * loading encryption keys
+      * booting...
+
+Keys are stored in `/var/db/vm-bhyve/keys/<name>.key` by default (mode 0400, directory 0700). You can
+change the directory with `vm_key_dir` in `/etc/rc.conf`, or set `encryption_key="file:///path"` per guest.
+Keep the keys outside the pool that holds the guests (for example on a separate GELI encrypted file system).
+A key stored on the same disks as the data does not protect it if the disks are stolen.
+
+The key is loaded when the guest starts and unloaded when it stops. Set `encryption_keep_loaded="yes"`
+to keep it loaded. `vm migrate`, `vm clone` and `vm image create` don't support encrypted guests yet.
+See the ENCRYPTION section of the man page for details.
+
 ## Windows Support
 
 Please see the Windows section in the [Wiki](https://github.com/freebsd/vm-bhyve/wiki/Running-Windows)

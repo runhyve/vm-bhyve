@@ -14,6 +14,7 @@ fi
 . "${LIB}/vm-cmd"
 . "${LIB}/vm-config"
 . "${LIB}/vm-core"
+. "${LIB}/vm-crypt"
 . "${LIB}/vm-datastore"
 . "${LIB}/vm-guest"
 . "${LIB}/vm-help"

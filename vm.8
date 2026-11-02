@@ -82,6 +82,7 @@
 .Op Fl c Ar vCPUs
 .Op Fl m Ar memory
 .Op Fl i Ar vm-image
+.Op Fl e
 .Op Fl C k Ar pubkey-file
 .Op Fl n Ar netconfig
 .Op Fl u Ar user-data-file
@@ -320,6 +321,90 @@ However,
 .Nm
 is now able to handle situations where the dataset mountpoint does not match
 the dataset name.
+.\" ============ ENCRYPTION =============
+.Sh ENCRYPTION
+Guests on a ZFS datastore can have their ZVOL disks encrypted using ZFS native
+encryption.
+Create the guest with
+.Nm
+.Cm create Fl e ,
+or set
+.Sy encryption="yes"
+in the template.
+All disks of an encrypted guest must be
+.Sy zvol
+or
+.Sy sparse-zvol ;
+.Sy file
+disks are refused.
+.Sy custom
+and
+.Sy iscsi
+disks are not managed by
+.Nm
+and are not encrypted.
+.Pp
+Each guest has its own randomly generated key, which is shared by all of its
+ZVOLs.
+Each ZVOL is its own ZFS encryption root, using
+.Sy aes-256-gcm
+and
+.Sy keyformat=hex .
+The guest dataset itself, which holds the configuration and logs, is not
+encrypted.
+.Pp
+By default keys are stored in
+.Pa /var/db/vm-bhyve/keys/$name.key .
+The directory can be changed in
+.Pa /etc/rc.conf :
+.Bd -literal -offset indent
+vm_key_dir="/secure/keys"
+.Ed
+.Pp
+Keys are created with mode 0400 in a directory with mode 0700.
+.Nm
+refuses to use a key that is not owned by the current user, that can be read by
+group or others, or that is in a directory writable by group or others.
+.Pp
+Keys should be kept outside of the pool that holds the guest, for example on a
+separate GELI encrypted or removable file system.
+A key stored on the same disks as the guest does not protect the data if those
+disks are stolen.
+.Pp
+The key is loaded by
+.Nm
+.Cm start
+and unloaded once the guest stops, including after a shutdown from inside the
+guest or a suspend.
+It stays loaded while the guest reboots.
+Set
+.Sy encryption_keep_loaded="yes"
+to keep it loaded.
+.Pp
+ZFS only sees
+.Sy keylocation=prompt ,
+and
+.Nm
+provides the key itself.
+This means
+.Ql zfs load-key -a
+does not unlock these guests, but renaming a guest or moving the key directory
+does not require any ZFS property changes.
+.Nm
+.Cm destroy
+removes the key if it is in the default location.
+.Nm
+.Cm rename
+moves it.
+.Pp
+.Nm
+.Cm migrate ,
+.Nm
+.Cm clone
+and
+.Nm
+.Cm image create
+are not supported for encrypted guests yet.
 .\" ============ QUICKSTART =============
 .Sh QUICKSTART
 Create a virtual switch called
@@ -703,6 +788,7 @@ network share) where you may want to store iso images.
 .Op Fl m Ar memory
 .br
 .Op Fl i Ar vm-image
+.Op Fl e
 .Op Fl C
 .Op Fl k Ar pubkey-file
 .Op Fl u Ar user-data-file
@@ -748,6 +834,13 @@ template.
 Specify a VM image using the filename stored in the
 .Pa $vm_dir/.img
 directory.
+.It Fl e
+Encrypt the disks of this guest.
+This is the same as setting
+.Sy encryption="yes"
+in the template.
+See
+.Sx ENCRYPTION .
 .It Fl C
 Enable cloud-init support for this guest.
 .It Fl k Ar pubkey-file
@@ -1880,6 +1973,29 @@ For example, the following will configure the ZVOL block size to 128k, and turn
 compression off.
 .Pp
 zfs_zvol_opts="volblocksize=128k compress=off"
+.It encryption
+Set to
+.Sy yes
+to encrypt every ZVOL created for this guest.
+This only affects ZVOLs created after the option is set, so it is normally
+specified in a template or by using
+.Nm
+.Cm create Fl e .
+See
+.Sx ENCRYPTION .
+.It encryption_key
+Location of the encryption key for this guest.
+Only
+.Sy file:///path/to/key
+is currently supported.
+If not set, the key is stored in
+.Pa $vm_key_dir/$name.key .
+If the key file already exists when the guest is created, it is used as is.
+.It encryption_keep_loaded
+By default the encryption key is unloaded when the guest stops.
+Set to
+.Sy yes
+to leave it loaded.
 .It prestart
 Allows you to specify a script or executable that will run before the guest
 starts, including on reboot.

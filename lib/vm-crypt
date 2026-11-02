@@ -1,0 +1,426 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# SPDX-FileCopyrightText: 2026 Mateusz Kwiatkowski
+
+# encrypted guest support
+#
+# a guest with encryption="yes" has every zvol created by vm-bhyve as its own
+# zfs encryption root. all zvols of a guest share one key, which is stored
+# outside of the datastore by a key backend. zfs only ever sees
+# keylocation=prompt, and we feed the key to zfs on stdin. this keeps backend
+# details (paths, urls) out of zfs properties, so renaming a guest or moving
+# the key store never requires a 'zfs set keylocation'.
+#
+# guest configuration:
+#   encryption="yes"              enable encryption for zvols created for this guest
+#   encryption_key="file:///path" key location (default file://$vm_key_dir/<guest>.key)
+#   encryption_keep_loaded="yes"  don't unload the key when the guest stops
+#
+# rc.conf:
+#   vm_key_dir                    directory for default key files (default /var/db/vm-bhyve/keys)
+#
+# functions that can fail set VM_CRYPT_ERROR, so callers can report the
+# problem in whatever style suits them (terminal, guest log, util::err)
+#
+# the guest configuration must already be loaded (config::load) before
+# calling any of the guest level functions
+
+VM_CRYPT_ZFS_OPTS="-o encryption=aes-256-gcm -o keyformat=hex -o keylocation=prompt"
+
+# is encryption enabled for the currently loaded guest
+#
+# @return success if encryption enabled
+#
+crypt::enabled(){
+    config::yesno "encryption"
+}
+
+# get the default key location for a guest
+#
+# @param string _var variable to put uri into
+# @param string _name the guest name
+#
+crypt::default_uri(){
+    local _var="$1"
+    local _name="$2"
+
+    setvar "${_var}" "file://${vm_key_dir:-/var/db/vm-bhyve/keys}/${_name}.key"
+}
+
+# get the key location for a guest
+# this is the encryption_key setting, or the default location if not set
+#
+# @param string _var variable to put uri into
+# @param string _name the guest name
+# @return success if the default location is used
+#
+crypt::key_uri(){
+    local _var="$1"
+    local _name="$2"
+    local _ku_uri
+
+    if config::get "_ku_uri" "encryption_key" && [ -n "${_ku_uri}" ]; then
+        setvar "${_var}" "${_ku_uri}"
+        return 1
+    fi
+
+    crypt::default_uri "${_var}" "${_name}"
+}
+
+# make sure a key exists and is usable
+#
+# @param string _uri the key location
+# @return success if the key can be used
+#
+crypt::check(){
+    local _uri="$1"
+    local _backend
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+    crypt::__${_backend}_check "${_uri}"
+}
+
+# create a new key, if one doesn't already exist at the specified location.
+# an existing key is reused, which allows users to supply their own key.
+#
+# @param string _uri the key location
+# @return success if a usable key now exists
+#
+crypt::generate(){
+    local _uri="$1"
+    local _backend
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+    crypt::__${_backend}_generate "${_uri}"
+}
+
+# write a key to stdout
+# caller should run crypt::check first to get a useful error message
+#
+# @param string _uri the key location
+#
+crypt::fetch(){
+    local _uri="$1"
+    local _backend
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+    crypt::__${_backend}_fetch "${_uri}"
+}
+
+# remove a key
+#
+# @param string _uri the key location
+#
+crypt::remove(){
+    local _uri="$1"
+    local _backend
+
+    crypt::__backend "_backend" "${_uri}" || return 1
+    crypt::__${_backend}_remove "${_uri}"
+}
+
+# move a key to a new location
+# both locations must use the same backend
+#
+# @param string _old current key location
+# @param string _new new key location
+#
+crypt::move(){
+    local _old="$1"
+    local _new="$2"
+    local _backend _new_backend
+
+    crypt::__backend "_backend" "${_old}" || return 1
+    crypt::__backend "_new_backend" "${_new}" || return 1
+
+    if [ "${_backend}" != "${_new_backend}" ]; then
+        VM_CRYPT_ERROR="unable to move encryption key between ${_backend} and ${_new_backend} backends"
+        return 1
+    fi
+
+    crypt::__${_backend}_move "${_old}" "${_new}"
+}
+
+# get the list of zvols for a guest that we manage encryption for.
+# this is any zvol under the guest dataset that is its own encryption
+# root and uses keylocation=prompt
+#
+# @param string _var variable to put zvol list into
+# @param string _name the guest name
+#
+crypt::volumes(){
+    local _var="$1"
+    local _name="$2"
+    local _list
+
+    _list=$(zfs list -rHo name,encryptionroot,keylocation -t volume "${VM_DS_ZFS_DATASET}/${_name}" 2>/dev/null | \
+        awk -F'\t' '$1 == $2 && $3 == "prompt" {print $1}')
+
+    setvar "${_var}" "${_list}"
+}
+
+# load the key for all encrypted zvols of a guest
+# does nothing if encryption is not enabled or keys are already loaded.
+# we wait for the zvol device nodes to appear before returning, as
+# zfs creates them asynchronously once the key is loaded
+#
+# @param string _name the guest name
+# @return success if all keys are loaded
+#
+crypt::load(){
+    local _name="$1"
+    local _uri _vols _vol _status _loaded _wait
+
+    VM_CRYPT_ERROR=""
+    crypt::enabled || return 0
+
+    crypt::key_uri "_uri" "${_name}"
+    crypt::volumes "_vols" "${_name}"
+
+    for _vol in ${_vols}; do
+        _status=$(zfs get -Ho value keystatus "${_vol}" 2>/dev/null)
+        [ "${_status}" = "available" ] && continue
+
+        # only check the key once we know we actually need it
+        if [ -z "${_loaded}" ]; then
+            crypt::check "${_uri}" || return 1
+        fi
+
+        crypt::fetch "${_uri}" | zfs load-key -L prompt "${_vol}" >/dev/null 2>&1
+
+        if [ $? -ne 0 ]; then
+            VM_CRYPT_ERROR="failed to load encryption key for ${_vol} from ${_uri}"
+            return 1
+        fi
+
+        _loaded="${_loaded} ${_vol}"
+    done
+
+    for _vol in ${_loaded}; do
+        _wait=0
+
+        while [ ! -e "/dev/zvol/${_vol}" -a ${_wait} -lt 30 ]; do
+            sleep 1
+            _wait=$((_wait + 1))
+        done
+
+        if [ ! -e "/dev/zvol/${_vol}" ]; then
+            VM_CRYPT_ERROR="key loaded but device /dev/zvol/${_vol} did not appear"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+# unload the key for all encrypted zvols of a guest
+# does nothing if encryption is not enabled or encryption_keep_loaded is set.
+# this will fail for any zvol that is still open
+#
+# @param string _name the guest name
+# @return success if all keys were unloaded
+#
+crypt::unload(){
+    local _name="$1"
+    local _vols _vol _status _rc=0
+
+    VM_CRYPT_ERROR=""
+    crypt::enabled || return 0
+    config::yesno "encryption_keep_loaded" && return 0
+
+    crypt::volumes "_vols" "${_name}"
+
+    for _vol in ${_vols}; do
+        _status=$(zfs get -Ho value keystatus "${_vol}" 2>/dev/null)
+        [ "${_status}" = "available" ] || continue
+
+        if ! zfs unload-key "${_vol}" >/dev/null 2>&1; then
+            VM_CRYPT_ERROR="failed to unload encryption key for ${_vol}"
+            _rc=1
+        fi
+    done
+
+    return ${_rc}
+}
+
+# get the backend for a key location
+#
+# @private
+# @param string _var variable to put backend name into
+# @param string _uri the key location
+#
+crypt::__backend(){
+    local _var="$1"
+    local _uri="$2"
+
+    case "${_uri}" in
+        file://*) setvar "${_var}" "file" ;;
+        *)
+            VM_CRYPT_ERROR="unsupported encryption key location '${_uri}'"
+            return 1
+            ;;
+    esac
+}
+
+# get the path from a file:// uri
+#
+# @private
+# @param string _var variable to put path into
+# @param string _uri the key location
+#
+crypt::__file_path(){
+    local _var="$1"
+    local _uri="$2"
+    local _fp_path="${_uri#file://}"
+
+    case "${_fp_path}" in
+        /*) ;;
+        *)
+            VM_CRYPT_ERROR="encryption key path must be absolute - '${_uri}'"
+            return 1
+            ;;
+    esac
+
+    setvar "${_var}" "${_fp_path}"
+}
+
+# make sure a key file is safe to use.
+# like ssh, we refuse a key that is not owned by us, or that can be
+# read by anyone else. the directory must not be writable by anyone
+# else, otherwise the key could be swapped out.
+#
+# @private
+# @param string _uri the key location
+#
+crypt::__file_check(){
+    local _uri="$1"
+    local _path _uid _stat
+
+    crypt::__file_path "_path" "${_uri}" || return 1
+    _uid=$(id -u)
+
+    if [ ! -f "${_path}" ]; then
+        VM_CRYPT_ERROR="encryption key ${_path} does not exist"
+        return 1
+    fi
+
+    _stat=$(stat -f '%u %Lp' "${_path}")
+
+    if [ "${_stat% *}" != "${_uid}" ]; then
+        VM_CRYPT_ERROR="encryption key ${_path} must be owned by uid ${_uid}"
+        return 1
+    fi
+
+    if [ $((0${_stat#* } & 077)) -ne 0 ]; then
+        VM_CRYPT_ERROR="encryption key ${_path} must not be accessible by group or others (chmod 400)"
+        return 1
+    fi
+
+    _stat=$(stat -f '%u %Lp' "${_path%/*}")
+
+    if [ "${_stat% *}" != "${_uid}" -a "${_stat% *}" != "0" ]; then
+        VM_CRYPT_ERROR="encryption key directory ${_path%/*} must be owned by uid ${_uid} or root"
+        return 1
+    fi
+
+    if [ $((0${_stat#* } & 022)) -ne 0 ]; then
+        VM_CRYPT_ERROR="encryption key directory ${_path%/*} must not be writable by group or others"
+        return 1
+    fi
+
+    if [ -z "$(head -c 1 "${_path}")" ]; then
+        VM_CRYPT_ERROR="encryption key ${_path} is empty"
+        return 1
+    fi
+
+    return 0
+}
+
+# create a new key file
+# the key is 32 random bytes, hex encoded to suit keyformat=hex
+#
+# @private
+# @param string _uri the key location
+#
+crypt::__file_generate(){
+    local _uri="$1"
+    local _path
+
+    crypt::__file_path "_path" "${_uri}" || return 1
+
+    # reuse an existing key
+    if [ -e "${_path}" ]; then
+        crypt::__file_check "${_uri}"
+        return $?
+    fi
+
+    if ! ( umask 077 && mkdir -p "${_path%/*}" ) >/dev/null 2>&1; then
+        VM_CRYPT_ERROR="unable to create encryption key directory ${_path%/*}"
+        return 1
+    fi
+
+    if ! ( umask 077 && openssl rand -hex 32 > "${_path}" ) 2>/dev/null; then
+        rm -f "${_path}" >/dev/null 2>&1
+        VM_CRYPT_ERROR="failed to generate encryption key ${_path}"
+        return 1
+    fi
+
+    chmod 400 "${_path}"
+    crypt::__file_check "${_uri}"
+}
+
+# output a key file
+#
+# @private
+# @param string _uri the key location
+#
+crypt::__file_fetch(){
+    local _uri="$1"
+    local _path
+
+    crypt::__file_path "_path" "${_uri}" || return 1
+    cat "${_path}"
+}
+
+# remove a key file
+#
+# @private
+# @param string _uri the key location
+#
+crypt::__file_remove(){
+    local _uri="$1"
+    local _path
+
+    crypt::__file_path "_path" "${_uri}" || return 1
+    [ -e "${_path}" ] || return 0
+
+    if ! rm -f "${_path}" >/dev/null 2>&1; then
+        VM_CRYPT_ERROR="failed to remove encryption key ${_path}"
+        return 1
+    fi
+}
+
+# move a key file
+#
+# @private
+# @param string _old current key location
+# @param string _new new key location
+#
+crypt::__file_move(){
+    local _old="$1"
+    local _new="$2"
+    local _old_path _new_path
+
+    crypt::__file_path "_old_path" "${_old}" || return 1
+    crypt::__file_path "_new_path" "${_new}" || return 1
+
+    if [ -e "${_new_path}" ]; then
+        VM_CRYPT_ERROR="encryption key ${_new_path} already exists"
+        return 1
+    fi
+
+    if ! mv "${_old_path}" "${_new_path}" >/dev/null 2>&1; then
+        VM_CRYPT_ERROR="failed to move encryption key ${_old_path} to ${_new_path}"
+        return 1
+    fi
+}

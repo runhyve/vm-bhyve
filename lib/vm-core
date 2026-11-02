@@ -130,13 +130,14 @@ core::create(){
     local _name _opt _size _vmdir _disk _disk_dev _num=0
     local _zfs_opts _disk_size _template="default" _ds="default" _ds_path _img _cpu _memory _uuid
     local _enable_cloud_init _cloud_init_dir _ssh_public_keys _ssh_public_key _ssh_key_file _network_config _mac
-    local _user_data_file
+    local _user_data_file _encrypt _key_uri
     local _network_config_interface _network_config_ipaddress _network_config_gateway4 \
           _network_config_gateway6 _network_config_nameservers _network_config_searchdomains \
           _network_config_hostname
 
-    while getopts d:t:s:i:c:m:Ck:n:u: _opt ; do
+    while getopts d:t:s:i:c:m:Ck:n:u:e _opt ; do
         case $_opt in
+            e) _encrypt="1" ;;
             t) _template=${OPTARG} ;;
             s) _size=${OPTARG} ;;
             d) _ds=${OPTARG} ;;
@@ -174,6 +175,28 @@ core::create(){
 
     # make sure template has a disk before we start creating anything
     [ -z "${_disk}" ] && util::err "template is missing disk0_name specification"
+
+    # encryption only works for zvols, so check every disk now
+    crypt::enabled && _encrypt="1"
+
+    if [ -n "${_encrypt}" ]; then
+        [ "${VM_DS_ZFS}" = "1" ] || util::err "encryption requires a ZFS datastore"
+
+        while [ -n "${_disk}" ]; do
+            case "${_disk_dev}" in
+                zvol|sparse-zvol|custom|iscsi) ;;
+                *) util::err "encrypted guests require zvol or sparse-zvol disks (disk${_num}_dev)" ;;
+            esac
+
+            _num=$((_num + 1))
+            config::get "_disk" "disk${_num}_name"
+            config::get "_disk_dev" "disk${_num}_dev"
+        done
+
+        _num=0
+        config::get "_disk" "disk0_name"
+        config::get "_disk_dev" "disk0_dev"
+    fi
 
     # get ssh public key for cloud-init from file
     if [ -n "${_ssh_key_file}" ]; then
@@ -217,6 +240,13 @@ core::create(){
     # get any zvol options
     config::get "_zfs_opts" "zfs_zvol_opts"
 
+    # create the encryption key before any disks
+    if [ -n "${_encrypt}" ]; then
+        config::set "${_name}" "encryption" "yes"
+        crypt::key_uri "_key_uri" "${_name}"
+        crypt::generate "${_key_uri}" || util::err "${VM_CRYPT_ERROR}"
+    fi
+
     # generate mac address - it's saved in _mac variable
     vm::generate_static_mac
 
@@ -230,11 +260,11 @@ core::create(){
     while [ -n "${_disk}" ]; do
         case "${_disk_dev}" in
             zvol)
-                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "0" "${_zfs_opts}"
+                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "0" "${_zfs_opts}" "${_key_uri}"
                 [ $_num -eq 0 ] && [ ! -z "$_img" ] && core::write_img "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_img}" "${_disk_dev}" "${_disk_size}"
                 ;;
             sparse-zvol)
-                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "1" "${_zfs_opts}"
+                zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_disk_size}" "1" "${_zfs_opts}" "${_key_uri}"
                 [ $_num -eq 0 ] && [ ! -z "$_img" ] && core::write_img "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" "${_img}" "${_disk_dev}" "${_disk_size}"
                 ;;
             custom)
@@ -263,6 +293,12 @@ core::create(){
 
     if [ -n "${_enable_cloud_init}" ]; then
         core::create_cloud_init
+    fi
+
+    # keys are loaded by zfs create, unload them until the guest is started
+    if [ -n "${_encrypt}" ]; then
+        config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+        crypt::unload "${_name}" || util::warn "${VM_CRYPT_ERROR}"
     fi
 
     exit 0
@@ -528,7 +564,7 @@ core::add_disk(){
     local _name="$1"
     local _device="$2"
     local _size="$3"
-    local _num=0 _curr _diskname _emulation _zfs_opts
+    local _num=0 _curr _diskname _emulation _zfs_opts _key_uri
 
     : ${_device:=file}
 
@@ -537,6 +573,16 @@ core::add_disk(){
     # get the last existing disk
     config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
     config::get "_zfs_opts" "zfs_zvol_opts"
+
+    # new zvols on an encrypted guest use the existing guest key
+    if crypt::enabled; then
+        case "${_device}" in
+            zvol|sparse-zvol) ;;
+            *) util::err "encrypted guests require zvol or sparse-zvol disks (use -t zvol|sparse-zvol)" ;;
+        esac
+
+        crypt::key_uri "_key_uri" "${_name}"
+    fi
 
     while true; do
         config::get "_curr" "disk${_num}_name"
@@ -550,11 +596,11 @@ core::add_disk(){
     # create the disk first, then update config if no problems
     case "${_device}" in
         zvol)
-            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "0" "${_zfs_opts}"
+            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "0" "${_zfs_opts}" "${_key_uri}"
             _diskname="disk${_num}"
             ;;
         sparse-zvol)
-            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "1" "${_zfs_opts}"
+            zfs::make_zvol "${VM_DS_ZFS_DATASET}/${_name}/disk${_num}" "${_size}" "1" "${_zfs_opts}" "${_key_uri}"
             _diskname="disk${_num}"
             ;;
         file)
@@ -572,6 +618,11 @@ core::add_disk(){
     config::set "${_name}" "disk${_num}_type" "${_emulation}" "1"
     config::set "${_name}" "disk${_num}_dev" "${_device}" "1"
     [ $? -eq 0 ] || util::err "disk image created but errors while updating guest configuration"
+
+    # zfs create loaded the key. if the guest is running, keys are unloaded when it stops
+    if [ -n "${_key_uri}" ] && vm::confirm_stopped "${_name}" "1" >/dev/null 2>&1; then
+        crypt::unload "${_name}" || util::warn "${VM_CRYPT_ERROR}"
+    fi
 }
 
 # add network interface to guest
@@ -903,6 +954,20 @@ core::__start(){
         return 1
     fi
 
+    # load encryption keys now so any problem is reported to the user.
+    # vm::run unloads them again once the guest stops
+    if crypt::enabled; then
+        echo "  * loading encryption keys"
+
+        if ! crypt::load "${_name}"; then
+            echo "  ! ${VM_CRYPT_ERROR}"
+
+            # don't leave keys loaded for any disks that did succeed
+            crypt::unload "${_name}" || echo "  ! ${VM_CRYPT_ERROR}"
+            return 1
+        fi
+    fi
+
     if util::check_bhyve_suspend >/dev/null 2>&1 && vm::has_saved_state "${_name}"; then
         echo "  * found saved vm state, resuming..."
     else
@@ -1078,7 +1143,7 @@ core::poweroff(){
 # @param string _name name of the guest
 #
 core::destroy(){
-    local _name
+    local _name _key_uri _key_default
 
     cmd::parse_args "$@"
     shift $?
@@ -1102,8 +1167,22 @@ core::destroy(){
         util::confirm "Are you sure you want to completely remove this virtual machine" || exit 0
     fi
 
+    # get key location while we still have the guest configuration
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+
+    if crypt::enabled; then
+        crypt::key_uri "_key_uri" "${_name}" && _key_default="1"
+    fi
+
     [ -n "${VM_DS_ZFS_DATASET}" ] && zfs::destroy_dataset "${VM_DS_ZFS_DATASET:?}/${_name:?}"
     [ -e "${VM_DS_PATH}/${_name}" ] && rm -R "${VM_DS_PATH:?}/${_name:?}"
+
+    # only remove keys we manage. a key given in encryption_key belongs to the user
+    if [ -n "${_key_default}" ]; then
+        crypt::remove "${_key_uri}" || util::warn "${VM_CRYPT_ERROR}"
+    elif [ -n "${_key_uri}" ]; then
+        echo "NOTICE: encryption key ${_key_uri} has not been removed"
+    fi
 
     exit 0
 }
@@ -1155,7 +1234,7 @@ core::discard(){
 core::rename(){
     local _old="$1"
     local _new="$2"
-    local _mv_failed
+    local _mv_failed _key_old _key_new
 
     [ -z "${_old}" -o -z "${_new}" ] && help::show "rename"
     util::check_name "${_new}" || util::err "invalid virtual machine name - '${_name}'"
@@ -1178,6 +1257,15 @@ core::rename(){
     # rename config file
     mv "${VM_DS_PATH}/${_new}/${_old}.conf" "${VM_DS_PATH}/${_new}/${_new}.conf" >/dev/null 2>&1
     [ $? -eq 0 ] || util::err "changed guest directory but failed to rename configuration file"
+
+    # move the key if it's in the default location, which is based on guest name
+    config::load "${VM_DS_PATH}/${_new}/${_new}.conf"
+
+    if crypt::enabled && crypt::key_uri "_key_new" "${_new}"; then
+        crypt::default_uri "_key_old" "${_old}"
+        crypt::move "${_key_old}" "${_key_new}" || \
+            util::err "renamed guest but ${VM_CRYPT_ERROR}. move the key manually or the guest will not start"
+    fi
 
     # rename saved vm state file
     _mv_failed=0

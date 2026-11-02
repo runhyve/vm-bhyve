@@ -270,7 +270,7 @@ info::guest_zfs(){
 #
 info::guest_disks(){
     local _num=0
-    local _disk _type _dev _path _size _b_size _used _b_used
+    local _disk _type _dev _path _size _b_size _used _b_used _crypt
     local _INDENT="    "
 
     while true; do
@@ -316,6 +316,17 @@ info::guest_disks(){
                 echo "${_INDENT}bytes-size: ${_size} (${_b_size})"
                 echo "${_INDENT}bytes-used: ${_used} (${_b_used})"
             fi
+
+            case "${_dev}" in
+                zvol|sparse-zvol)
+                    _crypt=$(zfs get -Ho value encryption,keystatus "${_path#/dev/zvol/}" | tr '\n' ' ')
+                    if [ -n "${_crypt}" -a "${_crypt%% *}" != "off" ]; then
+                        _crypt="${_crypt% }"
+                        echo "${_INDENT}encryption: ${_crypt%% *}"
+                        echo "${_INDENT}key-status: ${_crypt##* }"
+                    fi
+                    ;;
+            esac
         fi
 
         _num=$((_num + 1))

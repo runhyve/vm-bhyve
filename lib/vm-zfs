@@ -91,19 +91,32 @@ zfs::rename_dataset(){
 # @param string _name name of the zvol to create
 # @param string _size how big to create the dataset
 # @param int _sparse=0 set to 1 for a sparse zvol
+# @param string _user_opts zfs properties from zfs_zvol_opts
+# @param optional string _key_uri if set, encrypt the zvol using this key
 #
 zfs::make_zvol(){
     local _name="$1"
     local _size="$2"
     local _sparse="$3"
     local _user_opts="$4"
+    local _key_uri="$5"
     local _opt="-V"
 
     [ ! "${VM_DS_ZFS}" = "1" ] && util::err "cannot use ZVOL storage unless ZFS support is enabled"
     [ "${_sparse}" = "1" ] && _opt="-sV"
 
     zfs::__format_options "_user_opts" "${_user_opts}"
-    zfs create ${_opt} ${_size} -o volmode=dev ${_user_opts} "${_name}"
+
+    if [ -n "${_key_uri}" ]; then
+        # the key is passed on stdin, zfs reads it from there for keylocation=prompt
+        # zfs rejects duplicate properties, so zfs_zvol_opts can't override these
+        crypt::check "${_key_uri}" || util::err "${VM_CRYPT_ERROR}"
+        crypt::fetch "${_key_uri}" | \
+            zfs create ${_opt} ${_size} -o volmode=dev ${_user_opts} ${VM_CRYPT_ZFS_OPTS} "${_name}"
+    else
+        zfs create ${_opt} ${_size} -o volmode=dev ${_user_opts} "${_name}"
+    fi
+
     [ $? -eq 0 ] || util::err "failed to create new ZVOL ${_name}"
 }
 
@@ -261,6 +274,9 @@ zfs::clone(){
     datastore::get_guest "${_old}" || util::err "${_old} does not appear to be an existing virtual machine"
     [ ! "${VM_DS_ZFS}" = "1" ] && util::err "cannot clone guests on non-zfs datastores"
 
+    config::load "${VM_DS_PATH}/${_old}/${_old}.conf"
+    crypt::enabled && util::err "cloning encrypted guests is not supported yet"
+
     # get list of datasets to copy
     _fs_list=$(zfs list -rHo name -t filesystem,volume "${VM_DS_ZFS_DATASET}/${_old}")
     [ $? -eq 0 ] || util::err "unable to list datasets for ${VM_DS_ZFS_DATASET}/${_old}"
@@ -334,6 +350,9 @@ zfs::image_create(){
 
     datastore::get_guest "${_name}" || util::err "${_name} does not appear to be a valid virtual machine"
     [ -z "${VM_ZFS}" -o -z "${VM_DS_ZFS}" ] && util::err "this command is only supported on zfs datastores"
+
+    config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
+    crypt::enabled && util::err "creating images of encrypted guests is not supported yet"
 
     # create the image dataset if we don't have it
     if [ ! -e "${vm_dir}/images" ]; then

@@ -48,6 +48,19 @@ vm::run(){
     config::get "_slot" "start_slot" "4"
     config::get "_install_slot" "install_slot" "3"
 
+    # unload encryption keys whenever we exit from here on, including on fatal errors.
+    # keys are normally loaded by core::__start, but load here as well in case they
+    # have been unloaded since. guest reboots stay in the loop below, so keys
+    # remain loaded until the guest actually stops
+    if crypt::enabled; then
+        trap "vm::unload_keys '${_name}'" EXIT
+
+        if ! crypt::load "${_name}"; then
+            util::log "guest" "${_name}" "fatal; ${VM_CRYPT_ERROR}"
+            exit 15
+        fi
+    fi
+
     # generate a uuid if we don't have one already
     if [ -z "${_uuid}" ]; then
         _uuid=$(uuidgen)
@@ -457,6 +470,21 @@ vm::unlock(){
     unlink "${VM_DS_PATH}/${_name}/run.lock" >/dev/null 2>&1
     unlink "${VM_DS_PATH}/${_name}/suspending.lock" >/dev/null 2>&1
     unlink "${VM_DS_PATH}/${_name}/console" >/dev/null 2>&1
+}
+
+# unload encryption keys for a guest
+# this is run from an exit trap in vm::run, so only log any problems
+#
+# @param string _name the name of the guest
+#
+vm::unload_keys(){
+    local _name="$1"
+
+    if crypt::unload "${_name}"; then
+        config::yesno "encryption_keep_loaded" || util::log "guest" "${_name}" "encryption keys unloaded"
+    else
+        util::log "guest" "${_name}" "warning; ${VM_CRYPT_ERROR}"
+    fi
 }
 
 # create string for guest com ports

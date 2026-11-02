@@ -242,6 +242,9 @@ migration::__check_compat(){
     config::get "_setting" "passthru0"
     [ -n "${_setting}" ] && _err="pci pass-through enabled"
 
+    # needs raw send and key transfer, not supported yet
+    crypt::enabled && _err="disk encryption enabled"
+
     # check for custom disks
     # file/zvol are under guest dataset and should go across ok
     # custom disks could be anywhere
