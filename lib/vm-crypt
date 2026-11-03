@@ -5,7 +5,9 @@
 # encrypted guest support
 #
 # a guest with encryption="yes" has every zvol created by vm-bhyve as its own
-# zfs encryption root. all zvols of a guest share one key, which is stored
+# zfs encryption root, except clones, which stay in the encryption root of the
+# guest they were cloned from and so share its key (the clone gets its own copy
+# of the key). all zvols of a guest share one key, which is stored
 # outside of the datastore by a key backend. zfs only ever sees
 # keylocation=prompt, and we feed the key to zfs on stdin. this keeps backend
 # details (paths, urls) out of zfs properties, so renaming a guest or moving
@@ -201,22 +203,53 @@ crypt::move(){
     crypt::__${_backend}_move "${_old}" "${_new}"
 }
 
-# get the list of zvols for a guest that we manage encryption for.
-# this is any zvol under the guest dataset that is its own encryption
-# root and uses keylocation=prompt
+# get the list of encryption roots that we manage keys for on behalf of a guest.
+# these are the encryption roots of the zvols under the guest dataset, as long
+# as the root uses keylocation=prompt. normally each zvol is its own root, but
+# a cloned zvol stays in the encryption root of the zvol it was cloned from,
+# which belongs to another guest. keys are loaded and unloaded per root.
 #
-# @param string _var variable to put zvol list into
+# @param string _var variable to put the list of roots into
 # @param string _name the guest name
 #
 crypt::volumes(){
     local _var="$1"
     local _name="$2"
-    local _list
+    local _cv_roots _cv_root _cv_list=""
 
-    _list=$(zfs list -rHo name,encryptionroot,keylocation -t volume "${VM_DS_ZFS_DATASET}/${_name}" 2>/dev/null | \
-        awk -F'\t' '$1 == $2 && $3 == "prompt" {print $1}')
+    # local names are prefixed, setvar would otherwise set our own copy
+    # if the caller uses the same variable name
+    _cv_roots=$(zfs list -rHo encryptionroot -t volume "${VM_DS_ZFS_DATASET}/${_name}" 2>/dev/null | \
+        awk '$1 != "-" && !seen[$1]++')
 
-    setvar "${_var}" "${_list}"
+    for _cv_root in ${_cv_roots}; do
+        [ "$(zfs get -Ho value keylocation "${_cv_root}" 2>/dev/null)" = "prompt" ] || continue
+        _cv_list="${_cv_list}${_cv_list:+ }${_cv_root}"
+    done
+
+    setvar "${_var}" "${_cv_list}"
+}
+
+# see if a guest uses an encryption root of another guest, which is the case
+# for clones of encrypted guests
+#
+# @param string _name the guest name
+# @return success if any of the guest zvols are in a root outside the guest
+#
+crypt::shared(){
+    local _name="$1"
+    local _roots _root
+
+    crypt::volumes "_roots" "${_name}"
+
+    for _root in ${_roots}; do
+        case "${_root}" in
+            "${VM_DS_ZFS_DATASET}/${_name}/"*) ;;
+            *) return 0 ;;
+        esac
+    done
+
+    return 1
 }
 
 # see if a guest has any zvols that we manage encryption for.
@@ -231,6 +264,35 @@ crypt::is_encrypted(){
 
     crypt::volumes "_vols" "${_name}"
     [ -n "${_vols}" ]
+}
+
+# check that a key unlocks all encryption roots of a guest, without loading it.
+# zfs can only verify a key for a root that isn't loaded yet, so loaded roots
+# are skipped
+#
+# @param string _name the guest name
+# @param string _uri the key location
+# @return success if the key is correct
+#
+crypt::verify(){
+    local _name="$1"
+    local _uri="$2"
+    local _vols _vol
+
+    VM_CRYPT_ERROR=""
+    crypt::check "${_uri}" || return 1
+    crypt::volumes "_vols" "${_name}"
+
+    for _vol in ${_vols}; do
+        [ "$(zfs get -Ho value keystatus "${_vol}" 2>/dev/null)" = "available" ] && continue
+
+        if ! crypt::fetch "${_uri}" | zfs load-key -n -L prompt "${_vol}" >/dev/null 2>&1; then
+            VM_CRYPT_ERROR="${_uri} is not the encryption key for ${_vol}"
+            return 1
+        fi
+    done
+
+    return 0
 }
 
 # change the key of all encrypted zvols of a guest.
@@ -255,6 +317,12 @@ crypt::rekey(){
     VM_CRYPT_ERROR=""
     crypt::check "${_new}" || return 1
     crypt::volumes "_vols" "${_name}"
+
+    # changing a shared root would change the key of another guest
+    if crypt::shared "${_name}"; then
+        VM_CRYPT_ERROR="${_name} shares an encryption root with another guest, its key can't be changed"
+        return 1
+    fi
 
     for _vol in ${_vols}; do
         _loaded=""
@@ -285,7 +353,7 @@ crypt::rekey(){
 
 # load the key for all encrypted zvols of a guest
 # does nothing if encryption is not enabled or keys are already loaded.
-# we wait for the zvol device nodes to appear before returning, as
+# we wait for the guest zvol device nodes to appear before returning, as
 # zfs creates them asynchronously once the key is loaded
 #
 # @param string _name the guest name
@@ -320,6 +388,13 @@ crypt::load(){
         _loaded="${_loaded} ${_vol}"
     done
 
+    [ -z "${_loaded}" ] && return 0
+
+    # the loaded roots may not be the guest's own zvols (clones), so
+    # wait for every encrypted zvol of the guest
+    _loaded=$(zfs list -rHo name,encryption -t volume "${VM_DS_ZFS_DATASET}/${_name}" 2>/dev/null | \
+        awk -F'\t' '$2 != "off" {print $1}')
+
     for _vol in ${_loaded}; do
         _wait=0
 
@@ -339,16 +414,19 @@ crypt::load(){
 
 # unload the key for all encrypted zvols of a guest
 # does nothing if encryption is not enabled or encryption_keep_loaded is set.
-# this will fail for any zvol that is still open
+# zfs refuses to unload a root while any zvol in it is open, which happens
+# when a guest and its clone share a root and the other one is running.
+# that is not an error, the key is kept and VM_CRYPT_NOTICE says so
 #
 # @param string _name the guest name
-# @return success if all keys were unloaded
+# @return success if all keys were unloaded or are still in use
 #
 crypt::unload(){
     local _name="$1"
-    local _vols _vol _status _rc=0
+    local _vols _vol _status _out _rc=0
 
     VM_CRYPT_ERROR=""
+    VM_CRYPT_NOTICE=""
     crypt::enabled || return 0
     config::yesno "encryption_keep_loaded" && return 0
 
@@ -358,9 +436,18 @@ crypt::unload(){
         _status=$(zfs get -Ho value keystatus "${_vol}" 2>/dev/null)
         [ "${_status}" = "available" ] || continue
 
-        if ! zfs unload-key "${_vol}" >/dev/null 2>&1; then
-            VM_CRYPT_ERROR="failed to unload encryption key for ${_vol}"
-            _rc=1
+        _out=$(zfs unload-key "${_vol}" 2>&1)
+
+        if [ $? -ne 0 ]; then
+            case "${_out}" in
+                *busy*)
+                    VM_CRYPT_NOTICE="${VM_CRYPT_NOTICE}${VM_CRYPT_NOTICE:+; }encryption key for ${_vol} kept loaded, still in use"
+                    ;;
+                *)
+                    VM_CRYPT_ERROR="failed to unload encryption key for ${_vol}"
+                    _rc=1
+                    ;;
+            esac
         fi
     done
 

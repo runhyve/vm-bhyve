@@ -481,7 +481,11 @@ vm::unload_keys(){
     local _name="$1"
 
     if crypt::unload "${_name}"; then
-        config::yesno "encryption_keep_loaded" || util::log "guest" "${_name}" "encryption keys unloaded"
+        if [ -n "${VM_CRYPT_NOTICE}" ]; then
+            util::log "guest" "${_name}" "${VM_CRYPT_NOTICE}"
+        else
+            config::yesno "encryption_keep_loaded" || util::log "guest" "${_name}" "encryption keys unloaded"
+        fi
     else
         util::log "guest" "${_name}" "warning; ${VM_CRYPT_ERROR}"
     fi

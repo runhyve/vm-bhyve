@@ -425,9 +425,20 @@ The new guest is then switched to its own, newly generated key.
 ZFS only changes the key that wraps the data encryption key, so guests
 provisioned from the same image still share the data encryption key.
 .Pp
+ZFS does not allow the key of a clone to be changed, so a guest created with
 .Nm
 .Cm clone
-is not supported for encrypted guests yet.
+stays in the encryption roots of the guest it was cloned from, and shares its
+key.
+The clone gets its own copy of the key file, so either guest can be renamed or
+destroyed without affecting the other.
+As the key is shared, it stays loaded while either guest is running, and is
+only unloaded once both have stopped.
+As with any ZFS clone, the source guest can't be destroyed while the clone
+exists.
+Migrating a clone, or provisioning an image of one, only works on a host that
+has the snapshot it was cloned from, which is also the case for unencrypted
+guests.
 .\" ============ QUICKSTART =============
 .Sh QUICKSTART
 Create a virtual switch called
@@ -1218,6 +1229,10 @@ make sure the snapshot exists for the guest and any child ZVOLs, otherwise the
 clone will fail.
 .Pp
 Please note that this function requires ZFS.
+.Pp
+A clone of an encrypted guest shares the key of the source guest.
+See
+.Sx ENCRYPTION .
 .It Xo
 .Cm snapshot
 .Op Fl f

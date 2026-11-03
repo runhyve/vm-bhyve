@@ -356,7 +356,8 @@ A key stored on the same disks as the data does not protect it if the disks are 
 The key is loaded when the guest starts and unloaded when it stops. Set `encryption_keep_loaded="yes"`
 to keep it loaded. `vm migrate` sends encrypted guests raw and copies the key to the remote host.
 `vm image create` works too, but the image doesn't include the key, so provisioning it needs the key of the
-source guest (`vm image provision -k <keyfile> <uuid> <name>`). `vm clone` doesn't support encrypted guests yet.
+source guest (`vm image provision -k <keyfile> <uuid> <name>`). ZFS can't change the key of a clone, so
+`vm clone` gives the clone a copy of the source key, and the two guests share it.
 See the ENCRYPTION section of the man page for details.
 
 ## Windows Support

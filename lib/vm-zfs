@@ -253,7 +253,7 @@ zfs::rollback(){
 zfs::clone(){
     local _old="$1"
     local _name="$2"
-    local _fs _newfs _snap _snap_exists _fs_list _entry
+    local _fs _newfs _snap _snap_exists _fs_list _entry _key_uri _new_key _key
     local _num=0 _error=0
     local _uuid=$(uuidgen)
 
@@ -274,8 +274,16 @@ zfs::clone(){
     datastore::get_guest "${_old}" || util::err "${_old} does not appear to be an existing virtual machine"
     [ ! "${VM_DS_ZFS}" = "1" ] && util::err "cannot clone guests on non-zfs datastores"
 
+    # zfs can't change the key of a clone, so the clone stays in the encryption
+    # roots of the source and shares its key. make sure we have the key first
     config::load "${VM_DS_PATH}/${_old}/${_old}.conf"
-    crypt::enabled && util::err "cloning encrypted guests is not supported yet"
+
+    if crypt::enabled; then
+        crypt::key_uri "_key_uri" "${_old}"
+        crypt::check "${_key_uri}" || util::err "${VM_CRYPT_ERROR}"
+        crypt::default_uri "_new_key" "${_name}"
+        crypt::exists "${_new_key}" && util::err "encryption key ${_new_key} already exists"
+    fi
 
     # get list of datasets to copy
     _fs_list=$(zfs list -rHo name -t filesystem,volume "${VM_DS_ZFS_DATASET}/${_old}")
@@ -316,6 +324,19 @@ zfs::clone(){
 
     # generalise the clone
     vm::generalise "${_name}"
+
+    # give the clone its own copy of the key, so renaming or destroying
+    # either guest doesn't affect the other
+    if [ -n "${_key_uri}" ]; then
+        config::remove "${_name}" "encryption_key"
+        config::set "${_name}" "encryption" "yes"
+
+        _key=$(crypt::fetch "${_key_uri}")
+        crypt::store "${_new_key}" "${_key}" || \
+            util::err "cloned guest but ${VM_CRYPT_ERROR}. copy ${_key_uri} to ${_new_key} manually"
+
+        echo "NOTICE: ${_name} shares the encryption key of ${_old}, copied to ${_new_key}"
+    fi
 }
 
 # 'vm image create'
@@ -426,7 +447,7 @@ zfs::image_create(){
 zfs::image_provision(){
     local _uuid _name _file _oldname _entry _num=0 _type
     local _datastore="default" _decompress
-    local _encrypted _keyfile _img_key _new_key _new_key_created
+    local _encrypted _keyfile _img_key _new_key _new_key_created _shared
 
     while getopts d:k: _opt ; do
         case $_opt in
@@ -518,12 +539,26 @@ zfs::image_provision(){
 
         crypt::exists "${_new_key}" || _new_key_created="1"
 
-        if ! crypt::generate "${_new_key}" || ! crypt::rekey "${_name}" "${_img_key}" "${_new_key}"; then
+        # an image of a clone is received as a clone again if its origin
+        # exists here. it shares that encryption root, so keep the image key
+        if crypt::shared "${_name}"; then
+            _shared="1"
+            crypt::verify "${_name}" "${_img_key}" && \
+                crypt::store "${_new_key}" "$(crypt::fetch "${_img_key}")"
+        else
+            crypt::generate "${_new_key}" && crypt::rekey "${_name}" "${_img_key}" "${_new_key}"
+        fi
+
+        if [ $? -ne 0 ]; then
             echo "${0}: ERROR: ${VM_CRYPT_ERROR}" >&2
             echo "removing partially provisioned guest ${_name}" >&2
             zfs::destroy_dataset "${VM_DS_ZFS_DATASET}/${_name}"
             [ -n "${_new_key_created}" ] && crypt::remove "${_new_key}"
             exit 1
+        fi
+
+        if [ -n "${_shared}" ]; then
+            echo "NOTICE: ${_name} was received as a clone and shares the encryption key of its origin"
         fi
 
         echo "Encrypted guest ${_name} uses key ${_new_key}"
