@@ -376,7 +376,10 @@ The key is loaded by
 .Nm
 .Cm start
 and unloaded once the guest stops, including after a shutdown from inside the
-guest or a suspend.
+guest.
+Suspend is refused for encrypted guests because saved guest memory would be
+written to the unencrypted guest dataset.
+The suspendall command refuses the entire operation if any target is encrypted.
 It stays loaded while the guest reboots.
 Set
 .Sy encryption_keep_loaded="yes"

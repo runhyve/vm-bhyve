@@ -29,6 +29,87 @@
 
 VM_CRYPT_ZFS_OPTS="-o encryption=aes-256-gcm -o keyformat=hex -o keylocation=prompt"
 
+crypt::suspend_allowed(){
+    local _guest="$1" _properties
+    datastore::get_guest "${_guest}" || return 1
+    config::load "${VM_DS_PATH}/${_guest}/${_guest}.conf"
+    if crypt::enabled; then
+        util::warn "cannot suspend encrypted guest ${_guest}: saved memory would be unencrypted"
+        return 1
+    fi
+    if [ "${VM_DS_ZFS}" = 1 ]; then
+        _properties=$(zfs list -rHo encryption -t volume "${VM_DS_ZFS_DATASET}/${_guest}") || return 1
+        case "${_properties}" in
+            *aes-*) util::warn "cannot suspend encrypted guest ${_guest}: saved memory would be unencrypted"; return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# Only unload volumes created by this operation, never existing guest disks.
+crypt::creation_cleanup(){
+    local _volume
+    [ "${VM_CRYPT_CREATE_KEEP}" = yes ] && return 0
+    for _volume in ${VM_CRYPT_CREATED}; do
+        zfs unload-key "${_volume}" || util::warn "new volume ${_volume} remains unlocked; cleanup failed"
+    done
+    return 0
+}
+
+crypt::creation_begin(){
+    VM_CRYPT_CREATED=""
+    VM_CRYPT_CREATE_KEEP=no
+    config::yesno encryption_keep_loaded && VM_CRYPT_CREATE_KEEP=yes
+    trap 'crypt::creation_cleanup' EXIT
+    trap 'exit 1' HUP INT TERM
+}
+
+# Validate ancestors before creating children. Reject additional ACL grants.
+crypt::__safe_directory(){
+    local _dir="$1" _create="$2" _parent _meta _acl
+    case "${_dir}" in
+        /*) ;;
+        *) VM_CRYPT_ERROR="key directory must be absolute"; return 1 ;;
+    esac
+    case "/${_dir}/" in
+        */../*|*/./*) VM_CRYPT_ERROR="non-canonical key directory ${_dir}"; return 1 ;;
+    esac
+    if [ "${_dir}" != / ]; then
+        _parent=${_dir%/*}
+        crypt::__safe_directory "${_parent:-/}" "${_create}" || return 1
+    fi
+    if [ ! -e "${_dir}" ] && [ ! -L "${_dir}" ] && [ "${_create}" = create ]; then
+        (umask 077; mkdir "${_dir}") || return 1
+    fi
+    if [ -L "${_dir}" ] || [ ! -d "${_dir}" ]; then
+        VM_CRYPT_ERROR="unsafe key directory ${_dir}"
+        return 1
+    fi
+    _meta=$(stat -f '%u %Lp' "${_dir}") || return 1
+    if [ "${_meta% *}" != 0 ] || [ $((0${_meta#* } & 022)) -ne 0 ]; then
+        VM_CRYPT_ERROR="key directory ${_dir} must be root-owned and not group/world writable"
+        return 1
+    fi
+    _acl=$(ls -ld "${_dir}") || return 1
+    case "${_acl%% *}" in
+        *+) VM_CRYPT_ERROR="extended ACL on key directory ${_dir} is unsupported"; return 1 ;;
+    esac
+}
+
+# Isolated trap owns only the temporary file; link never replaces a target.
+crypt::__publish_key()(
+    _destination="$1"
+    _material="$2"
+    umask 077
+    _temporary=$(mktemp "${_destination%/*}/.vm-key.XXXXXXXX") || exit 1
+    trap 'rm -f "${_temporary}"' EXIT
+    trap 'exit 1' HUP INT TERM
+    printf '%s\n' "${_material}" > "${_temporary}" || exit 1
+    chmod 400 "${_temporary}" || exit 1
+    crypt::__file_check "file://${_temporary}" || exit 1
+    link "${_temporary}" "${_destination}"
+)
+
 # is encryption enabled for the currently loaded guest
 #
 # @return success if encryption enabled
@@ -505,17 +586,22 @@ crypt::__file_path(){
 #
 crypt::__file_check(){
     local _uri="$1"
-    local _path _uid _stat
+    local _path _uid _stat _acl
 
     crypt::__file_path "_path" "${_uri}" || return 1
+    crypt::__safe_directory "${_path%/*}" || return 1
     _uid=$(id -u)
 
-    if [ ! -f "${_path}" ]; then
+    if [ -L "${_path}" ] || [ ! -f "${_path}" ]; then
         VM_CRYPT_ERROR="encryption key ${_path} does not exist"
         return 1
     fi
 
     _stat=$(stat -f '%u %Lp' "${_path}")
+    _acl=$(ls -ld "${_path}") || return 1
+    case "${_acl%% *}" in
+        *+) VM_CRYPT_ERROR="extended ACL on key ${_path} is unsupported"; return 1 ;;
+    esac
 
     if [ "${_stat% *}" != "${_uid}" ]; then
         VM_CRYPT_ERROR="encryption key ${_path} must be owned by uid ${_uid}"
@@ -575,7 +661,7 @@ crypt::__file_store(){
     crypt::__file_path "_path" "${_uri}" || return 1
 
     # an existing key is fine if it's the same key
-    if [ -e "${_path}" ]; then
+    if [ -e "${_path}" ] || [ -L "${_path}" ]; then
         crypt::__file_check "${_uri}" || return 1
 
         if [ "$(cat "${_path}")" != "${_key}" ]; then
@@ -586,18 +672,16 @@ crypt::__file_store(){
         return 0
     fi
 
-    if ! ( umask 077 && mkdir -p "${_path%/*}" ) >/dev/null 2>&1; then
-        VM_CRYPT_ERROR="unable to create encryption key directory ${_path%/*}"
+    crypt::__safe_directory "${_path%/*}" create || return 1
+    if ! crypt::__publish_key "${_path}" "${_key}"; then
+        # A concurrent writer may have won. Accept only the same safe key.
+        if crypt::__file_check "${_uri}" && [ "$(cat "${_path}")" = "${_key}" ]; then
+            return 0
+        fi
+        VM_CRYPT_ERROR="failed to publish encryption key ${_path}; destination may contain a different key"
         return 1
     fi
 
-    if ! ( umask 077 && printf '%s\n' "${_key}" > "${_path}" ) 2>/dev/null; then
-        rm -f "${_path}" >/dev/null 2>&1
-        VM_CRYPT_ERROR="failed to write encryption key ${_path}"
-        return 1
-    fi
-
-    chmod 400 "${_path}"
     crypt::__file_check "${_uri}"
 }
 
