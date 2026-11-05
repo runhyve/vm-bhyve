@@ -118,6 +118,9 @@ zfs::make_zvol(){
     fi
 
     [ $? -eq 0 ] || util::err "failed to create new ZVOL ${_name}"
+    if [ -n "${_key_uri}" ]; then
+        VM_CRYPT_CREATED="${VM_CRYPT_CREATED} ${_name}"
+    fi
 }
 
 # format options for zfs commands

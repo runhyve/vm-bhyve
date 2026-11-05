@@ -353,6 +353,8 @@ change the directory with `vm_key_dir` in `/etc/rc.conf`, or set `encryption_key
 Keep the keys outside the pool that holds the guests (for example on a separate GELI encrypted file system).
 A key stored on the same disks as the data does not protect it if the disks are stolen.
 
+Suspend is refused for encrypted guests because saved memory would be unencrypted;
+`suspendall` refuses all targets if any is encrypted.
 The key is loaded when the guest starts and unloaded when it stops. Set `encryption_keep_loaded="yes"`
 to keep it loaded. `vm migrate`, `vm clone` and `vm image create` don't support encrypted guests yet.
 See the ENCRYPTION section of the man page for details.

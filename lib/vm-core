@@ -126,7 +126,7 @@ core::list(){
 # @param optional string (-s) _size guest size (default = 20G)
 # @param string _name the name of the guest to create
 #
-core::create(){
+core::create()(
     local _name _opt _size _vmdir _disk _disk_dev _num=0
     local _zfs_opts _disk_size _template="default" _ds="default" _ds_path _img _cpu _memory _uuid
     local _enable_cloud_init _cloud_init_dir _ssh_public_keys _ssh_public_key _ssh_key_file _network_config _mac
@@ -242,6 +242,7 @@ core::create(){
 
     # create the encryption key before any disks
     if [ -n "${_encrypt}" ]; then
+        crypt::creation_begin
         config::set "${_name}" "encryption" "yes"
         crypt::key_uri "_key_uri" "${_name}"
         crypt::generate "${_key_uri}" || util::err "${VM_CRYPT_ERROR}"
@@ -295,14 +296,8 @@ core::create(){
         core::create_cloud_init
     fi
 
-    # keys are loaded by zfs create, unload them until the guest is started
-    if [ -n "${_encrypt}" ]; then
-        config::load "${VM_DS_PATH}/${_name}/${_name}.conf"
-        crypt::unload "${_name}" || util::warn "${VM_CRYPT_ERROR}"
-    fi
-
     exit 0
-}
+)
 
 core::create_cloud_init(){
     local _cloud_init_dir _hostname
@@ -560,7 +555,7 @@ core::add(){
 # @param string _device type of device file|zvol|sparse-zvol
 # @param string _size size of the disk to create
 #
-core::add_disk(){
+core::add_disk()(
     local _name="$1"
     local _device="$2"
     local _size="$3"
@@ -576,6 +571,7 @@ core::add_disk(){
 
     # new zvols on an encrypted guest use the existing guest key
     if crypt::enabled; then
+        crypt::creation_begin
         case "${_device}" in
             zvol|sparse-zvol) ;;
             *) util::err "encrypted guests require zvol or sparse-zvol disks (use -t zvol|sparse-zvol)" ;;
@@ -619,11 +615,8 @@ core::add_disk(){
     config::set "${_name}" "disk${_num}_dev" "${_device}" "1"
     [ $? -eq 0 ] || util::err "disk image created but errors while updating guest configuration"
 
-    # zfs create loaded the key. if the guest is running, keys are unloaded when it stops
-    if [ -n "${_key_uri}" ] && vm::confirm_stopped "${_name}" "1" >/dev/null 2>&1; then
-        crypt::unload "${_name}" || util::warn "${VM_CRYPT_ERROR}"
-    fi
-}
+    # A newly added disk is not hot-attached; unload only that new volume.
+)
 
 # add network interface to guest
 #
@@ -786,6 +779,11 @@ core::suspendall()
     # get a list of running bhyve instances
     _running=$(pgrep -lf 'bhyve:' | cut -d" " -f3 | tr '\n' ' ')
     [ -z "${_running}" ] && return 0
+
+    # Preflight every target before suspending any guest or waiting for it.
+    for _curr in ${_running}; do
+        crypt::suspend_allowed "${_curr}" || return 1
+    done
 
     # do we have any guests to stop in order
     if [ -z "${VM_OPT_FORCE}" -a -n "${vm_list}" ]; then
@@ -1063,9 +1061,15 @@ core::suspend(){
 
     [ -z "${_name}" ] && help::show "suspend"
 
+    for _name in "$@"; do
+        crypt::suspend_allowed "${_name}" || return 1
+    done
+    _name="$1"
+
     datastore::get_guest "${_name}" || util::err "${_name} doesn't appear to be a valid virtual machine"
 
     while [ -n "${_name}" ]; do
+        datastore::get_guest "${_name}" || return 1
         if [ ! -e "/dev/vmm/${_name}" ]; then
             util::warn "${_name} doesn't appear to be a running virtual machine"
         else

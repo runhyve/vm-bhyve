@@ -27,6 +27,44 @@
 
 VM_CRYPT_ZFS_OPTS="-o encryption=aes-256-gcm -o keyformat=hex -o keylocation=prompt"
 
+# Inspect storage as well as configuration: removing the flag does not make
+# encrypted disks safe to suspend into the unencrypted guest directory.
+crypt::suspend_allowed(){
+    local _guest="$1" _properties
+    datastore::get_guest "${_guest}" || return 1
+    config::load "${VM_DS_PATH}/${_guest}/${_guest}.conf"
+    if crypt::enabled; then
+        util::warn "cannot suspend encrypted guest ${_guest}: saved memory would be unencrypted"
+        return 1
+    fi
+    if [ "${VM_DS_ZFS}" = 1 ]; then
+        _properties=$(zfs list -rHo encryption -t volume "${VM_DS_ZFS_DATASET}/${_guest}") || return 1
+        case "${_properties}" in
+            *aes-*) util::warn "cannot suspend encrypted guest ${_guest}: saved memory would be unencrypted"; return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+# Create/add run in a subshell so their cleanup cannot replace another
+# command's traps. Register only successfully created encrypted volumes.
+crypt::creation_cleanup(){
+    local _volume
+    [ "${VM_CRYPT_CREATE_KEEP}" = yes ] && return 0
+    for _volume in ${VM_CRYPT_CREATED}; do
+        zfs unload-key "${_volume}" || util::warn "new volume ${_volume} remains unlocked; cleanup failed"
+    done
+    return 0
+}
+
+crypt::creation_begin(){
+    VM_CRYPT_CREATED=""
+    VM_CRYPT_CREATE_KEEP=no
+    config::yesno encryption_keep_loaded && VM_CRYPT_CREATE_KEEP=yes
+    trap 'crypt::creation_cleanup' EXIT
+    trap 'exit 1' HUP INT TERM
+}
+
 # is encryption enabled for the currently loaded guest
 #
 # @return success if encryption enabled
@@ -294,17 +332,22 @@ crypt::__file_path(){
 #
 crypt::__file_check(){
     local _uri="$1"
-    local _path _uid _stat
+    local _path _uid _stat _acl
 
     crypt::__file_path "_path" "${_uri}" || return 1
+    crypt::__safe_directory "${_path%/*}" || return 1
     _uid=$(id -u)
 
-    if [ ! -f "${_path}" ]; then
+    if [ -L "${_path}" ] || [ ! -f "${_path}" ]; then
         VM_CRYPT_ERROR="encryption key ${_path} does not exist"
         return 1
     fi
 
     _stat=$(stat -f '%u %Lp' "${_path}")
+    _acl=$(ls -ld "${_path}") || return 1
+    case "${_acl%% *}" in
+        *+) VM_CRYPT_ERROR="extended ACL on key ${_path} is unsupported"; return 1 ;;
+    esac
 
     if [ "${_stat% *}" != "${_uid}" ]; then
         VM_CRYPT_ERROR="encryption key ${_path} must be owned by uid ${_uid}"
@@ -349,25 +392,71 @@ crypt::__file_generate(){
     crypt::__file_path "_path" "${_uri}" || return 1
 
     # reuse an existing key
-    if [ -e "${_path}" ]; then
+    if [ -e "${_path}" ] || [ -L "${_path}" ]; then
         crypt::__file_check "${_uri}"
         return $?
     fi
 
-    if ! ( umask 077 && mkdir -p "${_path%/*}" ) >/dev/null 2>&1; then
-        VM_CRYPT_ERROR="unable to create encryption key directory ${_path%/*}"
+    crypt::__safe_directory "${_path%/*}" create || return 1
+    if ! crypt::__publish_key "${_path}"; then
+        # A concurrent writer may have published first. Never replace it.
+        if [ -e "${_path}" ] || [ -L "${_path}" ]; then
+            crypt::__file_check "${_uri}"
+            return $?
+        fi
+        VM_CRYPT_ERROR="failed to publish encryption key ${_path}"
         return 1
     fi
 
-    if ! ( umask 077 && openssl rand -hex 32 > "${_path}" ) 2>/dev/null; then
-        rm -f "${_path}" >/dev/null 2>&1
-        VM_CRYPT_ERROR="failed to generate encryption key ${_path}"
-        return 1
-    fi
-
-    chmod 400 "${_path}"
     crypt::__file_check "${_uri}"
 }
+
+# Check ancestors before creating children. Reject symlinks, writable ancestors
+# and extended ACLs; mode bits alone do not describe ACL access grants.
+crypt::__safe_directory(){
+    local _dir="$1" _create="$2" _parent _meta _acl
+    case "${_dir}" in
+        /*) ;;
+        *) VM_CRYPT_ERROR="key directory must be absolute"; return 1 ;;
+    esac
+    case "/${_dir}/" in
+        */../*|*/./*) VM_CRYPT_ERROR="non-canonical key directory ${_dir}"; return 1 ;;
+    esac
+    if [ "${_dir}" != / ]; then
+        _parent=${_dir%/*}
+        crypt::__safe_directory "${_parent:-/}" "${_create}" || return 1
+    fi
+    if [ ! -e "${_dir}" ] && [ ! -L "${_dir}" ] && [ "${_create}" = create ]; then
+        (umask 077; mkdir "${_dir}") || return 1
+    fi
+    if [ -L "${_dir}" ] || [ ! -d "${_dir}" ]; then
+        VM_CRYPT_ERROR="unsafe key directory ${_dir}"
+        return 1
+    fi
+    _meta=$(stat -f '%u %Lp' "${_dir}") || return 1
+    if [ "${_meta% *}" != 0 ] || [ $((0${_meta#* } & 022)) -ne 0 ]; then
+        VM_CRYPT_ERROR="key directory ${_dir} must be root-owned and not group/world writable"
+        return 1
+    fi
+    _acl=$(ls -ld "${_dir}") || return 1
+    case "${_acl%% *}" in
+        *+) VM_CRYPT_ERROR="extended ACL on key directory ${_dir} is unsupported"; return 1 ;;
+    esac
+}
+
+# Isolated trap owns only the temporary file. link publishes atomically without
+# replacing an existing destination (including a dangling symbolic link).
+crypt::__publish_key()(
+    _destination="$1"
+    umask 077
+    _temporary=$(mktemp "${_destination%/*}/.vm-key.XXXXXXXX") || exit 1
+    trap 'rm -f "${_temporary}"' EXIT
+    trap 'exit 1' HUP INT TERM
+    openssl rand -hex 32 > "${_temporary}" || exit 1
+    chmod 400 "${_temporary}" || exit 1
+    crypt::__file_check "file://${_temporary}" || exit 1
+    link "${_temporary}" "${_destination}"
+)
 
 # output a key file
 #
